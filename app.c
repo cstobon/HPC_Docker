@@ -1,125 +1,146 @@
 // --- Compilación y ejecución ---
 
 //@Autor: Edgar Tobon Sosa
-//@Compilación: gcc -o lectura_file_2 lectura_file_2.c -lpthread 
-//@Ejecución: ./lectura_file_2 <archivo_1.txt> <archivo_2.txt> <cadena>
+//@Compilación: mpicc -fopenmp -o buscador_hibrido app.c 
+//@Ejecución: mpirun -np 2 ./buscador_hibrido <archivo> <cadena>
 
 // --- Bibliotecas ---  
-
-#include <stdio.h>		// ** Libreria estandar para entrada y salida de datos  
-#include <stdlib.h>		// ** Libreria para utilizar atoll
-#include <fcntl.h>		// ** Libreria para trabajar con archivos 
+#include <mpi.h>        // ** Libreria para computacion distribuida (Maestro/Esclavo)
+#include <stdio.h>      // ** Libreria estandar para entrada y salida de datos  
+#include <stdlib.h>     // ** Libreria para utilizar atoll
+#include <fcntl.h>      // ** Libreria para trabajar con archivos 
 #include <sys/mman.h>   // ** Libreria para mapear el archivo en memoria RAM
 #include <sys/stat.h>   // ** Libreria para obtener informacion sobre archivos
-#include <string.h>		// ** Libreria para la maniupulacion de cadenas
-#include <unistd.h>		// ** Libreria para operar sobre archivos (Lectura)
-#include <signal.h>     // ** Libreria para que un proceso envie señales a otros procesos
+#include <string.h>     // ** Libreria para la maniupulacion de cadenas
+#include <unistd.h>     // ** Libreria para operar sobre archivos (Lectura)
 #include <time.h>
-// -- Variables globales
+#include <omp.h>        // ** Libreria para hilos en CPU local
 
-#include<omp.h>			// ** Libreria par
+#define NUM_HILOS 20  //Define el numero de hilos locales que generará cada Nodo
 
-#define NUM_HILOS 20  //Define el numero de hilos que se generarán
-
-
-// -- SECCIÓN CRITICA --
-// ** Varible que indica cuando la cadena ya ha sido encontrada
-// 0: FALSE
-// 1: TRUE 
-
-int repetition = 0;
-// --- Main ---
 int main(int argc, char *argv[]) {
-    // Debe recibir 3 argumentos: ./programa <ruta_arch1> <ruta_arch2> <cadena_a_buscar>
-    if (argc != 5) {
-        printf("Uso: %s <archivo_1> <cadena> <offset_1> <size_1>\n", argv[0]);
+    // --- 1. Inicialización de MPI ---
+    MPI_Init(&argc, &argv);
+
+    int mpi_rank, mpi_size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank); // 0 = Maestro, >0 = Esclavos
+    MPI_Comm_size(MPI_COMM_WORLD, &mpi_size); // Total de nodos en el clúster
+
+    // Ahora solo recibimos el archivo y la cadena
+    if (argc != 3) {
+        if (mpi_rank == 0) printf("Uso: mpirun -np <nodos> %s <archivo> <cadena>\n", argv[0]);
+        MPI_Finalize();
         return 1;
     }
 
-    const char *archivo_ruta_1 = argv[1];   // ** Nombre del archivo
-    const char *cadena = argv[2];		    // ** Cadena de busqueda	
-	
-	// --- Variables para medir el tiempo de ejecución
-	struct timespec inicio, fin;    
+    const char *archivo_ruta_1 = argv[1];
+    const char *cadena = argv[2];       
+    size_t len_cadena = strlen(cadena);
 
-	size_t offset_1 = atoll(argv[3]); // Cast String -> long long int
- 	size_t tamano_1 = atoll(argv[4]); // Cast String -> long long int
-    
-	// Variables para ambos archivos
-    int fd_1; //Variables que que almaceneran el identificador del archivo
-    char *mapa_archivo_1 = NULL; //Mapeo de archivo al espacio de direcciones del proceso
+    struct timespec inicio, fin;    
+    if (mpi_rank == 0) clock_gettime(CLOCK_MONOTONIC, &inicio); // Solo el maestro toma el tiempo total
 
+    // Arreglo para almacenar el Offset (índice 0) y el Tamaño (índice 1) que procesará este nodo
+    long long limites[2]; 
 
+    // --- 2. Lógica del Maestro (Repartir el trabajo) ---
+    if (mpi_rank == 0) {
+        struct stat st;
+        if (stat(archivo_ruta_1, &st) == -1) {
+            perror("El Maestro no pudo leer el archivo");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        long long total_size = st.st_size;
+        long long chunk_base = total_size / mpi_size;
+        long long residuo = total_size % mpi_size;
 
-    // --- Archivo 1 ---
-    fd_1 = open(archivo_ruta_1, O_RDONLY);  //Asignación de valor entero con la operacion open para fd_1
-    if (fd_1 == -1) {
-        perror("Error: No puedo abrir el archivo");
-        return( 1 );
-    }
-	
-	 // -- Alinear offset a la página del sistema --
-     long page_size = sysconf(_SC_PAGE_SIZE); //Obtiene el tamaño de una pagina de memoria
-     size_t offset_1_aligned =(offset_1 / page_size) * page_size;  //Alineación con el inicio de la pagina de memoria 
-     size_t offset_1_diff = offset_1 - offset_1_aligned; //Define donde empezar a comparar la cadena
-     size_t tamano_1_adjusted = tamano_1 + offset_1_diff; //Ajusta los bytes leido ocasionado por la alineación de la pagina
+        for (int i = 0; i < mpi_size; i++) {
+            long long chunk_offset = i * chunk_base;
+            long long chunk_size = chunk_base;
 
-	// -- Función clave mmap, para mapear el archivo al espacio de direcciones el proces --
-	// NULL: Permite que el kernel decida donde ubicar el mapa en memoria
-	// Tamaño de archivo: Cantidad de bytes a mapear
-	// PROT_READ: Define el permiso de solo lectura al proceso
-	// MAP_PRIVATE: Permite que el archivo original pemanezca inmutable
-	// fd_1: descriptor del archivo, el archivo que se va a mapear
-	// offset_1_alignment: offset desde que posición se va a mapear
-
-	// Mapear solo la porción asignada del Archivo 1
-     char *mapa_base_1 = mmap(NULL, tamano_1_adjusted, PROT_READ, MAP_PRIVATE, fd_1, offset_1_aligned);
-     if (mapa_base_1 == MAP_FAILED) {
-         perror("Error al mapear memoria (mmap) para Archivo 1");
-         close(fd_1);
-         return 1;
-    }
-	mapa_archivo_1 = mapa_base_1 + offset_1_diff;
-
-	omp_set_num_threads(NUM_HILOS);
-
-	size_t len_cadena = strlen(cadena);
-	size_t limite_busqueda = tamano_1 < len_cadena ? 0 : tamano_1 - len_cadena;
-	clock_gettime(CLOCK_MONOTONIC, &inicio); // Medición del tiempo de ejecucion
-
-	#pragma omp parallel for schedule(static) reduction(+:repetition)
-	for( size_t i = 0; i <= limite_busqueda ; i++){
-		if( memcmp(mapa_archivo_1 + i, cadena, len_cadena) == 0 ){
-			repetition += 1;
-			
-			#pragma omp critical
-            {
-                // %zu imprime el byte exacto
-                // %.*s imprime exactamente 'len_cadena' caracteres, evitando que se desborde
-                printf("[Hilo %d] Coincidencia en el byte %zu -> Texto: %.*s\n", 
-                       omp_get_thread_num(), 
-                       i, 
-                       (int)len_cadena, 
-                       mapa_archivo_1 + i);
+            // El último nodo se lleva el residuo de la división
+            if (i == mpi_size - 1) {
+                chunk_size += residuo;
+            } else {
+                // Truco de Solapamiento: Si no es el último nodo, lee 'len_cadena - 1' bytes extras
+                // para encontrar palabras que queden justo a la mitad del corte.
+                chunk_size += (len_cadena - 1);
             }
 
-		}
-	}
- 
-    // Desmapear y cerrar el primer archivo
-	munmap(mapa_base_1, tamano_1_adjusted);
-    close(fd_1);
+            if (i == 0) {
+                // El Maestro se auto-asigna su parte
+                limites[0] = chunk_offset;
+                limites[1] = chunk_size;
+            } else {
+                // El Maestro le envía los límites a los esclavos
+                long long msj[2] = {chunk_offset, chunk_size};
+                MPI_Send(msj, 2, MPI_LONG_LONG, i, 0, MPI_COMM_WORLD);
+            }
+        }
+        printf("[Maestro] Archivo de %lld bytes repartido entre %d nodos.\n", total_size, mpi_size);
+    } 
+    // --- 3. Lógica del Esclavo (Recibir instrucciones) ---
+    else {
+        // Los esclavos esperan a recibir sus límites de memoria desde el Maestro
+        MPI_Recv(limites, 2, MPI_LONG_LONG, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    // --- 4. Procesamiento Local (Todos los nodos hacen esto con su fragmento asignado) ---
+    size_t offset_1 = limites[0];
+    size_t tamano_1 = limites[1];
+    int repetition = 0; // Contador local de este nodo
+
+    int fd_1 = open(archivo_ruta_1, O_RDONLY); 
+    if (fd_1 != -1) {
+        long page_size = sysconf(_SC_PAGE_SIZE); 
+        size_t offset_1_aligned = (offset_1 / page_size) * page_size;  
+        size_t offset_1_diff = offset_1 - offset_1_aligned; 
+        size_t tamano_1_adjusted = tamano_1 + offset_1_diff; 
+
+        char *mapa_base_1 = mmap(NULL, tamano_1_adjusted, PROT_READ, MAP_PRIVATE, fd_1, offset_1_aligned);
+        
+        if (mapa_base_1 != MAP_FAILED) {
+            char *mapa_archivo_1 = mapa_base_1 + offset_1_diff;
+            size_t limite_busqueda = tamano_1 < len_cadena ? 0 : tamano_1 - len_cadena;
+
+            omp_set_num_threads(NUM_HILOS);
+
+            #pragma omp parallel for schedule(static) reduction(+:repetition)
+            for(size_t i = 0; i <= limite_busqueda ; i++){
+                if( memcmp(mapa_archivo_1 + i, cadena, len_cadena) == 0 ){
+                    repetition += 1;
+                }
+            }
+
+            munmap(mapa_base_1, tamano_1_adjusted);
+        } else {
+            printf("[Nodo %d] Error en mmap.\n", mpi_rank);
+        }
+        close(fd_1);
+    }
+
+    printf("[Nodo %d] Fragmento analizado. Encontradas: %d\n", mpi_rank, repetition);
+
+    // --- 5. Reducción Global MPI (Sumar los resultados de todo el clúster) ---
+    int total_repetition_cluster = 0;
     
+    // MPI_Reduce recolecta la variable 'repetition' de todos los nodos, 
+    // las suma (MPI_SUM) y guarda el total en 'total_repetition_cluster' dentro del Rank 0.
+    MPI_Reduce(&repetition, &total_repetition_cluster, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
-	//Asignación de tiempo final en la variable fin
-	clock_gettime(CLOCK_MONOTONIC, &fin);
-	double total = (fin.tv_sec - inicio.tv_sec) + (fin.tv_nsec - inicio.tv_nsec) / 1e9; //Tiempo total
+    // --- 6. Salida de Resultados (Solo el Maestro) ---
+    if (mpi_rank == 0) {
+        clock_gettime(CLOCK_MONOTONIC, &fin);
+        double total = (fin.tv_sec - inicio.tv_sec) + (fin.tv_nsec - inicio.tv_nsec) / 1e9; 
+        
+        printf("\n===================================================\n");
+        printf("RESULTADO CLUSTER: Cadena encontrada %d veces\n", total_repetition_cluster);
+        printf("Tiempo total de procesamiento en LAN: %.6f s\n", total);
+        printf("===================================================\n");
+    }
 
-	
- 	printf("\n=========================\n");
-	printf("\nNumero total de coincidencias: %d\n", repetition);
-    printf("Tiempo total: %.6f s\n", total);
-    printf("=========================\n");
-
+    // Finalizar red MPI
+    MPI_Finalize();
     return 0;
 }
