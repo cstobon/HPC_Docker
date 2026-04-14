@@ -26,10 +26,11 @@ WORKDIR /app
 
 # 4. Copiar tus programas
 COPY app.c .
-COPY cadenas.txt .
+COPY generador_cadenas.c .
 
 # 5. Compilar
 # Compilamos el programa híbrido (MPI + OpenMP)
+RUN gcc -o generador_cadenas generador_cadenas.c
 RUN mpicc -fopenmp app.c -o buscador_cadena
 
 # 6. Exponer puerto SSH
